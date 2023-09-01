@@ -1,0 +1,318 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+################################################################################
+# Copyright 2023 BITDOL CO., LTD.
+#
+#
+#     http://www.github.com/hun7176
+#
+# Author: seungheon choi
+################################################################################
+import rospy, roslaunch
+import subprocess
+import os
+import sys
+from enum import Enum
+from std_msgs.msg import UInt8, Float64
+ 
+class CoreNodeController():
+    def __init__(self):
+        self.ros_package_path = os.path.dirname(os.path.realpath(__file__))
+        self.ros_package_path = self.ros_package_path.replace('formula_core/nodes', '')
+
+        self.sub_obstacle_stamped = rospy.Subscriber('/detect/obstacle_stamped', UInt8, self.cbobstacleStamped, queue_size=1)
+        #detect_~~가 실행되어 동작이 끝나면 detect노드에서 토픽을 보내고, cb~~~Stamped함수가 실행된다. 이 함수의 역할은 토픽을 통해 decider노드로 전송하는 것이다.
+        self.sub_mode_control = rospy.Subscriber('/core/decided_mode', UInt8, self.cbReceiveMode, queue_size=1)
+        # decider에서 토픽을 Subscribe한다. 초기에 data=2을 넣어서 시작시킨다. 토픽을 받으면 cbReceiveMode가 실행되는데 이 함수는 <is_triggered>를 참으로 바꾸는 함수이다.
+
+        self.pub_obstacle_order = rospy.Publisher('/detect/obstacle_order', UInt8, queue_size=1)
+        #동작이 시작되는 과정에서 거치는 함수. detect_~_sign에서 감지 후, decider에서 판단한 값을 controller로 전달(decided_mode) 그 후 currentmode가 바뀌고 detect_~로 publish하여 동작을 수행하도록 한다.
+        self.pub_mode_return = rospy.Publisher('/core/returned_mode', UInt8, queue_size=1)
+
+        self.CurrentMode = Enum('CurrentMode', 'idle lane_following obstacle')
+        self.current_mode = self.CurrentMode.idle.value
+        #현재 작업상태를 저장하는 함수이다. 
+        #
+        # 1정지 2라인주행 3장애물탐지 idle lane_following obstacle
+        #
+
+        self.StepOfobstacle = Enum('StepOfobstacle', 'searching_obstacle_sign go_in_to_obstacle navigation go_out_from_obstacle exit')      
+        self.current_step_obstacle = self.StepOfobstacle.searching_obstacle_sign.value
+        #미션에 들어왔을때 미션수행 순서이다.
+        # 
+        # 1장애물 감지 2.slam열기 3장애물 피하기 4exit
+        #searching_obstacle start_slam avoid_and_navigation exit
+        #
+        self.Launcher = Enum('Launcher', 'launch_camera_ex_calib launch_detect_sign launch_detect_lane launch_detect_obstacle launch_control_lane launch_control_obstacle launch_control_moving')
+        self.uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
+        
+        self.launch_camera_launched = False
+        self.launch_detect_sign_launched = False
+        self.launch_detect_lane_launched = False    
+        self.launch_detect_obstacle_launched = False
+        self.launch_control_lane_launched = False
+        self.launch_control_obstacle_launched = False
+        self.launch_control_moving_launched = False
+
+        self.is_triggered = False
+
+        loop_rate = rospy.Rate(10) # 10hz
+        while not rospy.is_shutdown():
+            if self.is_triggered == True:
+                self.fnControlNode()
+            
+            loop_rate.sleep()
+
+    def cbReceiveMode(self, mode_msg):
+        rospy.loginfo("starts the progress with %d", mode_msg.data)
+        
+        self.current_mode = mode_msg.data
+        self.is_triggered = True
+
+
+    # Which step is in obstacle
+    def cbobstacleStamped(self, obstacle_msg):
+        rospy.loginfo("obstacle Step changed from %d", self.current_step_obstacle)
+
+        self.current_step_obstacle = obstacle_msg.data
+
+        rospy.loginfo("into %d", self.current_step_obstacle)
+
+        if self.current_step_obstacle == self.StepOfobstacle.searching_obstacle_sign.value:
+            self.current_mode = self.CurrentMode.obstacle.value
+            msg_mode_return = UInt8  
+            msg_mode_return.data = self.current_mode
+            self.pub_mode_return.publish(msg_mode_return)
+
+        self.is_triggered =  True
+
+    def fnControlNode(self):  #이게 무한루프 동작
+        # 1정지 2라인주행 3장애물탐지 idle lane_following obstacle
+        # 현재 모드가 lane_following 
+        if self.current_mode == self.CurrentMode.lane_following.value:
+            rospy.loginfo("New trigger for lane_following")
+
+            self.fnLaunch(self.Launcher.launch_camera_ex_calib.value, True)
+
+            self.fnLaunch(self.Launcher.launch_detect_lane.value, True)
+            self.fnLaunch(self.Launcher.launch_detect_sign.value, True)
+            self.fnLaunch(self.Launcher.launch_detect_obstacle.value, False)
+
+            self.fnLaunch(self.Launcher.launch_control_lane.value, True)
+            self.fnLaunch(self.Launcher.launch_control_obstacle.value, False)
+            self.fnLaunch(self.Launcher.launch_control_moving.value, False)
+
+
+        # 현재모드가 장애물탐지
+        elif self.current_mode == self.CurrentMode.obstacle.value:
+            rospy.loginfo("New trigger for obstacle")
+            msg_pub_obstacle_order = UInt8()
+        # 
+        # 1장애물 감지 2느려지기 3.slam열기 4장애물 피하기
+        #searching_obstacle start_slam avoid_and_navigation exit 
+        # 
+            if self.current_step_obstacle == self.StepOfobstacle.searching_obstacle_sign.value:
+                rospy.loginfo("Current step : searching_obstacle_sign")
+                rospy.loginfo("Go to next step : go_in_to_obstacle")
+
+                msg_pub_obstacle_order.data = self.StepOfobstacle.go_in_to_obstacle.value
+
+                self.fnLaunch(self.Launcher.launch_camera_ex_calib.value, False)
+
+                self.fnLaunch(self.Launcher.launch_detect_lane.value, False)
+                self.fnLaunch(self.Launcher.launch_detect_obstacle.value, True)
+                self.fnLaunch(self.Launcher.launch_detect_sign.value, False)
+
+                self.fnLaunch(self.Launcher.launch_control_lane.value, False)
+                self.fnLaunch(self.Launcher.launch_control_obstacle.value, False)
+                self.fnLaunch(self.Launcher.launch_control_moving.value, True)
+                                   
+            elif self.current_step_obstacle == self.StepOfobstacle.go_in_to_obstacle.value:
+                rospy.loginfo("Current step : go_in_to_obstacle")
+                rospy.loginfo("Go to next step : navigation")
+
+                msg_pub_obstacle_order.data = self.StepOfobstacle.navigation.value
+
+                self.fnLaunch(self.Launcher.launch_camera_ex_calib.value, False)
+
+                self.fnLaunch(self.Launcher.launch_detect_lane.value, False)
+                self.fnLaunch(self.Launcher.launch_detect_obstacle.value, True)
+                self.fnLaunch(self.Launcher.launch_detect_sign.value, False)
+
+                self.fnLaunch(self.Launcher.launch_control_lane.value, False)
+                self.fnLaunch(self.Launcher.launch_control_obstacle.value, True)
+                self.fnLaunch(self.Launcher.launch_control_moving.value, False)
+
+            elif self.current_step_obstacle == self.StepOfobstacle.navigation.value:
+                rospy.loginfo("Current step : navigation")
+                rospy.loginfo("Go to next step : go_out_from_obstacle")
+
+                msg_pub_obstacle_order.data = self.StepOfobstacle.go_out_from_obstacle.value
+
+                self.fnLaunch(self.Launcher.launch_camera_ex_calib.value, True)
+
+                self.fnLaunch(self.Launcher.launch_detect_sign.value, False)
+                self.fnLaunch(self.Launcher.launch_detect_lane.value, False)
+                self.fnLaunch(self.Launcher.launch_detect_obstacle.value, True)
+
+                self.fnLaunch(self.Launcher.launch_control_lane.value, False)
+                self.fnLaunch(self.Launcher.launch_control_obstacle.value, False)
+                self.fnLaunch(self.Launcher.launch_control_moving.value, True)
+
+            elif self.current_step_obstacle == self.StepOfobstacle.go_out_from_obstacle.value:
+                rospy.loginfo("Current step : go_out_from_obstacle")
+                rospy.loginfo("Go to next step : exit")
+
+                msg_pub_obstacle_order.data = self.StepOfobstacle.exit.value
+
+                self.fnLaunch(self.Launcher.launch_camera_ex_calib.value, True)
+             
+                self.fnLaunch(self.Launcher.launch_detect_obstacle.value, False)
+                self.fnLaunch(self.Launcher.launch_detect_lane.value, True)
+                self.fnLaunch(self.Launcher.launch_detect_sign.value, True)
+             
+                self.fnLaunch(self.Launcher.launch_control_lane.value, True)
+                self.fnLaunch(self.Launcher.launch_control_obstacle.value, False)
+                self.fnLaunch(self.Launcher.launch_control_moving.value, False)
+
+            elif self.current_step_obstacle == self.StepOfobstacle.exit.value:
+                rospy.loginfo("Current step : exit")
+                rospy.loginfo("Go to next step : searching_obstacle_sign")
+
+                msg_pub_obstacle_order.data = self.StepOfobstacle.searching_tunneROSLaunchParentvalue
+
+                self.fnLaunch(self.Launcher.launch_camera_ex_calib.value, True)
+
+                self.fnLaunch(self.Launcher.launch_detect_obstacle.value, False)
+                self.fnLaunch(self.Launcher.launch_detect_lane.value, True)
+                self.fnLaunch(self.Launcher.launch_detect_sign.value, True)
+                
+                self.fnLaunch(self.Launcher.launch_control_lane.value, True)
+                self.fnLaunch(self.Launcher.launch_control_obstacle.value, False)
+                self.fnLaunch(self.Launcher.launch_control_moving.value, False)
+                
+            rospy.sleep(2)
+
+            self.pub_obstacle_order.publish(msg_pub_obstacle_order)
+
+        self.is_triggered = False
+
+    def fnLaunch(self, launch_num, is_start):
+        if launch_num == self.Launcher.launch_camera_ex_calib.value:
+            if is_start == True:
+                if self.launch_camera_launched == False:
+                    self.launch_camera = roslaunch.scriptapi.ROSLaunch()
+                    self.launch_camera = roslaunch.parent.ROSLaunchParent(self.uuid, [self.ros_package_path + "formula_camera/launch/extrinsic_camera_calibration.launch"])
+                    self.launch_camera_launched = True
+                    self.launch_camera.start()
+                else:
+                    pass
+            else:
+                if self.launch_camera_launched == True:
+                    self.launch_camera_launched = False
+                    self.launch_camera.shutdown()
+                else:
+                    pass
+                    
+        elif launch_num == self.Launcher.launch_detect_sign.value:
+            if is_start == True:
+                if self.launch_detect_sign_launched == False:
+                    self.launch_detect_sign = roslaunch.scriptapi.ROSLaunch()
+                    self.launch_detect_sign = roslaunch.parent.ROSLaunchParent(self.uuid, [self.ros_package_path + "formula_detect/launch/detect/detect_sign_obstacle.launch"])
+                    self.launch_detect_sign_launched = True
+                    self.launch_detect_sign.start()
+                else:
+                    pass
+            else:
+                if self.launch_detect_sign_launched == True:
+                    self.launch_detect_sign_launched = False
+                    self.launch_detect_sign.shutdown()
+                else:
+                    pass    
+
+        elif launch_num == self.Launcher.launch_detect_lane.value:
+            if is_start == True:
+                if self.launch_detect_lane_launched == False:
+                    self.launch_detect_lane = roslaunch.scriptapi.ROSLaunch()
+                    self.launch_detect_lane = roslaunch.parent.ROSLaunchParent(self.uuid, [self.ros_package_path + "formula_detect/launch/detect_lane.launch"])
+                    self.launch_detect_lane_launched = True
+                    self.launch_detect_lane.start()
+                else:
+                    pass
+            else:
+                if self.launch_detect_lane_launched == True:
+                    self.launch_detect_lane_launched = False
+                    self.launch_detect_lane.shutdown()
+                else:
+                    pass                                  
+        
+        elif launch_num == self.Launcher.launch_detect_obstacle.value:
+            if is_start == True:
+                if self.launch_detect_obstacle_launched == False:
+                    self.launch_detect_obstacle = roslaunch.scriptapi.ROSLaunch()
+                    self.launch_detect_obstacle = roslaunch.parent.ROSLaunchParent(self.uuid, [self.ros_package_path + "formula_detect/launch/detect_obstacle.launch"])     
+                    self.launch_detect_obstacle_launched = True
+                    self.launch_detect_obstacle.start()
+                else:
+                    pass
+            else:
+                if self.launch_detect_obstacle_launched == True:
+                    self.launch_detect_obstacle_launched = False
+                    self.launch_detect_obstacle.shutdown()
+                else:
+                    pass    
+
+        elif launch_num == self.Launcher.launch_control_lane.value:
+            if is_start == True:
+                if self.launch_control_lane_launched == False:
+                    self.launch_control_lane = roslaunch.scriptapi.ROSLaunch()
+                    self.launch_control_lane = roslaunch.parent.ROSLaunchParent(self.uuid, [self.ros_package_path + "formula_driving/launch/formula_control_lane.launch"])
+                    self.launch_control_lane_launched = True
+                    self.launch_control_lane.start()
+                else:
+                    pass
+            else:
+                if self.launch_control_lane_launched == True:
+                    self.launch_control_lane_launched = False
+                    self.launch_control_lane.shutdown()
+                else:
+                    pass  
+
+        elif launch_num == self.Launcher.launch_control_obstacle.value:
+            if is_start == True:
+                if self.launch_control_obstacle_launched == False:
+                    self.launch_control_obstacle = roslaunch.scriptapi.ROSLaunch()
+                    self.launch_control_obstacle = roslaunch.parent.ROSLaunchParent(self.uuid, [self.ros_package_path + "formula_driving/launch/formula_control_obstacle.launch"])     
+                    self.launch_control_obstacle_launched = True
+                    self.launch_control_obstacle.start()
+                else:
+                    pass
+            else:
+                if self.launch_control_obstacle_launched == True:
+                    self.launch_control_obstacle_launched = False
+                    self.launch_control_obstacle.shutdown()
+                else:
+                    pass
+
+        elif launch_num == self.Launcher.launch_control_moving.value:
+            if is_start == True:
+                if self.launch_control_moving_launched == False:
+                    self.launch_control_moving = roslaunch.scriptapi.ROSLaunch()
+                    self.launch_control_moving = roslaunch.parent.ROSLaunchParent(self.uuid, [self.ros_package_path + "formula_driving/launch/formula_control_moving.launch"])
+                    self.launch_control_moving_launched = True
+                    self.launch_control_moving.start()
+                else:
+                    pass
+            else:
+                if self.launch_control_moving_launched == True:
+                    self.launch_control_moving_launched = False
+                    self.launch_control_moving.shutdown()
+                pass
+
+    def main(self):
+        rospy.spin()
+
+if __name__ == '__main__':
+    rospy.init_node('core_node_controller')
+    node = CoreNodeController()
+    node.main()

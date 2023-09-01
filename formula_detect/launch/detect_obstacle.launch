@@ -1,0 +1,4 @@
+<launch>
+  <node pkg="formula_detect" type="detect_obstacle" name="detect_obstacle" output="screen">
+  </node>
+</launch>
